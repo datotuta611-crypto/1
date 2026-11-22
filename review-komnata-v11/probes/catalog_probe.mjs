@@ -1,0 +1,14 @@
+const root = process.argv[2];
+const {api} = await import(root + "/room.mjs");
+const {localDatabase} = await import(root + "/sqlite.mjs");
+const db = localDatabase(":memory:"); const env = {DB: db, ROOM_BRIDGE_KEY: "k"};
+const call = async (path, body, worker=false) => { const h={"content-type":"application/json","oai-authenticated-user-id":"o"}; if(worker) h["x-room-bridge"]="k";
+  const r = await api(new Request("https://r.test/api/"+path,{method:body?"POST":"GET",headers:h,body:body?JSON.stringify(body):undefined}),env); return {status:r.status,...await r.json()}; };
+await call("message",{text:"Мира, привет"});
+const good = {id:"gpt-6.2-astra",name:"Astra",efforts:["high","xhigh"],defaultEffort:"xhigh"};
+const odd = {id:"gpt-6.3-preview:2026-11",name:"Preview",efforts:["high"],defaultEffort:"high"};
+const catalog = {defaults:{mira:"gpt-6.2-astra",lev:"gpt-6.2-astra"},models:[good,odd]};
+const r = await call("bridge/claim",{turnDecisions:true,agentSettings:true,chatMemory:true,catalog},true);
+const st = await call("state");
+console.log("claim с одной необычной моделью в каталоге: HTTP", r.status, r.error, "| job:", r.job ?? null);
+console.log("индикатор в браузере после такого claim: bridge.online =", st.bridge.online, "| room.active =", st.room.active);
