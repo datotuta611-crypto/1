@@ -7,9 +7,13 @@
 #   GIT_NAME="Имя Фамилия" GIT_EMAIL="me@example.com" bash setup-claude-box.sh
 #
 # Все переменные необязательны. CB_USER по умолчанию dev.
-# Повторный запуск безопасен. Сгенерированные файлы перезаписываются; если файл
-# правили вручную, старая версия сохраняется рядом как <файл>.bak-<дата>.
-# Вход по подписке и настройки Claude (том claude-docker_claude_memory) сохраняются.
+# CB_FIX_VOLUME_OWNER=1 — только после решения человека: передать текущему
+# пользователю том настроек Claude, который принадлежит другому UID.
+#
+# У каждого пользователя свои образ (claude-agent-<имя>) и том настроек
+# (claude-box-<имя>_claude_memory). Повторный запуск безопасен. Сгенерированные
+# файлы перезаписываются; если файл правили вручную, старая версия сохраняется
+# рядом как <файл>.bak-<дата>. Вход по подписке и настройки Claude сохраняются.
 #
 # Коды выхода: 0 — готово, 1 — ошибка, 2 — нет Docker или docker compose v2.
 # Итоговые строки начинаются с "[setup] ИТОГ".
@@ -30,7 +34,7 @@ put() {
     local bak
     bak="$f.bak-$(date +%Y%m%d-%H%M%S)"
     cp -p "$f" "$bak"
-    log "$f отличался от эталонного, старая версия сохранена: $bak"
+    log "$f изменён (ручная правка или прежняя версия установщика), старая копия: $bak"
   fi
   mv -f "$tmp" "$f"
 }
@@ -41,20 +45,25 @@ user_setup() {
   [ "$(id -u)" != 0 ] || die "установка для root запрещена: контейнер должен работать от обычного пользователя"
   docker info >/dev/null 2>&1 || die "у пользователя $(id -un) нет доступа к Docker (нужна группа docker)"
 
-  local D="$HOME/claude-docker" BIN="$HOME/.local/bin"
+  local D="$HOME/claude-docker" BIN="$HOME/.local/bin" SLUG PROJ IMG VOL
   mkdir -p "$D" "$BIN"
+
+  # Имена образа и тома — свои для каждого пользователя сервера
+  SLUG=$(id -un | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')
+  [ -n "$SLUG" ] || SLUG="u$(id -u)"
+  PROJ="claude-box-$SLUG" IMG="claude-agent-$SLUG" VOL="claude-box-${SLUG}_claude_memory"
 
   put "$D/Dockerfile" 644 <<'EOF'
 FROM node:22-bookworm-slim
-
-ARG USER_ID=1000
-ARG GROUP_ID=1000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code
+
+ARG USER_ID=1000
+ARG GROUP_ID=1000
 
 # ID 0 (root на хосте) пропускаем; -o допускает ID, уже занятый в образе
 RUN if [ "$GROUP_ID" != "0" ]; then groupmod -o -g "$GROUP_ID" node; fi \
@@ -80,7 +89,7 @@ services:
       args:
         USER_ID: ${HOST_UID:-1000}
         GROUP_ID: ${HOST_GID:-1000}
-    image: claude-agent
+    image: ${CB_IMAGE:?run setup-claude-box.sh}
     env_file:
       - claude.env
     working_dir: ${PROJECT_DIR:?run via claude-box}
@@ -99,7 +108,8 @@ volumes:
   claude_memory:
 EOF
 
-  printf 'HOST_UID=%s\nHOST_GID=%s\n' "$(id -u)" "$(id -g)" > "$D/.env"
+  printf 'COMPOSE_PROJECT_NAME=%s\nCB_IMAGE=%s\nCB_VOLUME=%s\nHOST_UID=%s\nHOST_GID=%s\n' \
+    "$PROJ" "$IMG" "$VOL" "$(id -u)" "$(id -g)" > "$D/.env"
 
   # claude.env: только подпись git. Ключа API здесь быть не должно:
   # ANTHROPIC_API_KEY перекрывает вход по подписке.
@@ -140,15 +150,19 @@ check_dir() {
   d=$(realpath -e -- "$1")
   case "$HOME/" in "${d%/}/"*) die "$d — домашняя папка или выше, укажите папку проекта";; esac
   [ "$(stat -c %u "$d")" = "$(id -u)" ] || die "$d принадлежит другому пользователю"
+  # Папка без своего .git, но с git-репозиториями внутри (до 3 уровней) —
+  # скорее всего, папка с несколькими проектами. Проекты без git так не распознать.
   if [ ! -e "$d/.git" ] && [ "${CLAUDE_BOX_ALLOW_PARENT:-}" != 1 ]; then
-    for s in "$d"/*/; do
-      if [ -e "${s}.git" ]; then
-        die "$d похожа на папку с несколькими проектами (в ${s%/} есть .git). Укажите один проект. Если это действительно один проект: CLAUDE_BOX_ALLOW_PARENT=1 claude-box …"
-      fi
-    done
+    s=$(find "$d" -mindepth 1 -maxdepth 4 -name node_modules -prune -o -name .git -print -quit 2>/dev/null || true)
+    if [ -n "$s" ]; then
+      die "$d похожа на папку с несколькими проектами (внутри есть репозиторий ${s%/.git}). Укажите один проект. Если это действительно один проект: CLAUDE_BOX_ALLOW_PARENT=1 claude-box …"
+    fi
   fi
   printf '%s\n' "$d"
 }
+
+# envval <имя>: значение из ~/claude-docker/.env (его пишет установщик)
+envval() { sed -n "s/^$1=//p" ~/claude-docker/.env 2>/dev/null | head -1; }
 
 case "${1:-}" in
   --update)
@@ -157,16 +171,18 @@ case "${1:-}" in
     ;;
   --vscode)
     dir=$(check_dir "${2:-}") || exit 1
+    img=$(envval CB_IMAGE); vol=$(envval CB_VOLUME)
+    [ -n "$img" ] && [ -n "$vol" ] || die "нет ~/claude-docker/.env — сначала запустите setup-claude-box.sh"
     mkdir -p "$dir/.devcontainer/claude-box"
     cat > "$dir/.devcontainer/claude-box/devcontainer.json" <<JSON
 {
   "name": "claude-box",
-  "image": "claude-agent",
+  "image": "$img",
   "remoteUser": "node",
   "updateRemoteUserUID": false,
   "workspaceMount": "source=\${localWorkspaceFolder},target=\${localWorkspaceFolder},type=bind",
   "workspaceFolder": "\${localWorkspaceFolder}",
-  "mounts": ["source=claude-docker_claude_memory,target=/home/node/.claude,type=volume"],
+  "mounts": ["source=$vol,target=/home/node/.claude,type=volume"],
   "runArgs": ["--env-file", "$HOME/claude-docker/claude.env", "--cpus", "2", "--memory", "2g"],
   "customizations": {
     "vscode": {
@@ -197,7 +213,7 @@ EOF
     printf '\nexport PATH="$HOME/.local/bin:$PATH"  # claude-box: PATH\n' >> "$HOME/.bashrc"
   fi
 
-  log "сборка образа claude-agent (несколько минут)…"
+  log "сборка образа $IMG (несколько минут)…"
   # PROJECT_DIR при сборке не используется, но compose требует его значение
   (cd "$D" && PROJECT_DIR=/nonexistent docker compose build --quiet) || die "сборка образа не удалась (вывод выше)"
 
@@ -206,14 +222,19 @@ EOF
   local T out ver st method login mode vowner
   T=$(mktemp -d "$HOME/.cache/claude-box-selftest.XXXXXX")
 
-  # Том настроек мог остаться от прежней установки с другим UID: выравниваем владельца
+  # Том настроек с другим владельцем: в нём могут быть чужие данные входа и
+  # история сессий. Передаём его только по явному решению человека.
   vowner=$(cd "$D" && PROJECT_DIR="$T" docker compose run --rm -T claude stat -c %u /home/node/.claude 2>/dev/null) \
     || { rm -rf "$T"; die "тестовый контейнер не запустился"; }
   if [ "$vowner" != "$(id -u)" ]; then
+    if [ "${CB_FIX_VOLUME_OWNER:-}" != 1 ]; then
+      rm -rf "$T"
+      die "том $VOL принадлежит uid $vowner, а установка идёт для $(id -un) (uid $(id -u)). В томе могут быть данные входа и история сессий другого человека. Решение за человеком: если это ваш прежний том — повторите установку с CB_FIX_VOLUME_OWNER=1; чтобы начать с чистого тома — выполните docker volume rm $VOL и повторите установку"
+    fi
     (cd "$D" && PROJECT_DIR="$T" docker compose run --rm -T --user 0:0 claude \
        chown -R "$(id -u):$(id -g)" /home/node/.claude) >/dev/null 2>&1 \
-      || { rm -rf "$T"; die "не удалось исправить владельца тома claude-docker_claude_memory"; }
-    log "том claude-docker_claude_memory принадлежал uid $vowner, владелец исправлен на $(id -un)"
+      || { rm -rf "$T"; die "не удалось сменить владельца тома $VOL"; }
+    log "том $VOL: владелец изменён с uid $vowner на $(id -un) (uid $(id -u)) по CB_FIX_VOLUME_OWNER=1"
   fi
 
   out=$(cd "$D" && PROJECT_DIR="$T" docker compose run --rm -T claude sh -c \
@@ -252,6 +273,7 @@ EOF
 
   log "ИТОГ: готово"
   log "ИТОГ: пользователь: $(id -un) (uid $(id -u)), папка: $D"
+  log "ИТОГ: образ: $IMG, том настроек Claude: $VOL"
   log "ИТОГ: команда: $BIN/claude-box"
   log "ИТОГ: Claude Code: $ver"
   log "ИТОГ: вход: $login"
@@ -284,6 +306,7 @@ if [ "$(id -u)" = 0 ]; then
   usermod -aG docker "$CB_USER"
   rc=0
   runuser -u "$CB_USER" -- env GIT_NAME="${GIT_NAME:-}" GIT_EMAIL="${GIT_EMAIL:-}" \
+    CB_FIX_VOLUME_OWNER="${CB_FIX_VOLUME_OWNER:-}" \
     bash -c "$(declare -f log die on_err put user_setup); user_setup" || rc=$?
   case "$rc" in
     0|1|2) exit "$rc" ;;
